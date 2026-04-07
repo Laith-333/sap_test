@@ -1,0 +1,217 @@
+name: Create Config & Store in Key Vault
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_name:
+        description: 'Server/Config name'
+        required: true
+        type: string
+      server_ip:
+        description: 'Server IP address'
+        required: true
+        type: string
+      network:
+        description: 'Network/Subnet'
+        required: true
+        type: choice
+        options:
+          - production-network
+          - staging-network
+          - dev-network
+          - dmz-network
+      environment:
+        description: 'Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+jobs:
+  create-and-store:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+      
+      - name: Create config file
+        id: create_config
+        run: |
+          # Create config file
+          cat > config.json <<EOF
+          {
+            "server_name": "${{ github.event.inputs.server_name }}",
+            "server_ip": "${{ github.event.inputs.server_ip }}",
+            "network": "${{ github.event.inputs.network }}",
+            "environment": "${{ github.event.inputs.environment }}",
+            "created_by": "${{ github.actor }}",
+            "created_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+            "repository": "${{ github.repository }}",
+            "workflow_run": "${{ github.run_id }}"
+          }
+          EOF
+          
+          echo "Config file created:"
+          cat config.json
+          
+          # Generate secret name
+          SECRET_NAME="config-${{ github.event.inputs.server_name }}-${{ github.event.inputs.environment }}"
+          echo "secret_name=$SECRET_NAME" >> $GITHUB_OUTPUT
+      
+      - name: Display config preview
+        run: |
+          echo "### Config Preview" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+          cat config.json >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Secret Name**: ${{ steps.create_config.outputs.secret_name }}" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Request approval before storing
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: ${{ github.actor }}
+          issue-title: "Approve: Store config '${{ github.event.inputs.server_name }}' in Key Vault"
+          issue-body: |
+            ## Configuration Details
+            
+            **Server Name**: ${{ github.event.inputs.server_name }}
+            **Server IP**: ${{ github.event.inputs.server_ip }}
+            **Network**: ${{ github.event.inputs.network }}
+            **Environment**: ${{ github.event.inputs.environment }}
+            
+            ### Generated Config:
+            ```json
+            {
+              "server_name": "${{ github.event.inputs.server_name }}",
+              "server_ip": "${{ github.event.inputs.server_ip }}",
+              "network": "${{ github.event.inputs.network }}",
+              "environment": "${{ github.event.inputs.environment }}",
+              "created_by": "${{ github.actor }}",
+              "created_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            }
+            ```
+            
+            **Secret Name**: config-${{ github.event.inputs.server_name }}-${{ github.event.inputs.environment }}
+            
+            Please review and approve to store in Key Vault.
+      
+      - name: Store config in Azure Key Vault
+        run: |
+          VAULT_NAME="${{ secrets.AZURE_VAULT_NAME }}"
+          SECRET_NAME="${{ steps.create_config.outputs.secret_name }}"
+          CONFIG_VALUE=$(cat config.json)
+          
+          # Store as secret (with hyphens converted to underscores for Key Vault naming)
+          SECRET_NAME_VAULT=$(echo $SECRET_NAME | tr '-' '_')
+          
+          echo "Storing secret: $SECRET_NAME_VAULT"
+          
+          az keyvault secret set \
+            --vault-name $VAULT_NAME \
+            --name $SECRET_NAME_VAULT \
+            --value "$CONFIG_VALUE"
+          
+          echo "✓ Secret stored successfully"
+          echo "secret_stored=true" >> $GITHUB_OUTPUT
+      
+      - name: Verify storage
+        run: |
+          VAULT_NAME="${{ secrets.AZURE_VAULT_NAME }}"
+          SECRET_NAME="${{ steps.create_config.outputs.secret_name }}"
+          SECRET_NAME_VAULT=$(echo $SECRET_NAME | tr '-' '_')
+          
+          echo "Verifying secret in Key Vault..."
+          az keyvault secret show \
+            --vault-name $VAULT_NAME \
+            --name $SECRET_NAME_VAULT \
+            --query name -o tsv
+          
+          echo "✓ Verification successful"
+      
+      - name: Log success
+        run: |
+          echo "### ✅ Config Stored in Key Vault" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Secret Name**: config_${{ github.event.inputs.server_name }}_${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Server IP**: ${{ github.event.inputs.server_ip }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Network**: ${{ github.event.inputs.network }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Stored by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Time**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f config.json
+          echo "Cleaned up local config file"
+
+  use-config-in-terraform:
+    runs-on: ubuntu-latest
+    needs: create-and-store
+    if: success()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+      
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+      
+      - name: Retrieve config from Key Vault
+        id: retrieve
+        run: |
+          VAULT_NAME="${{ secrets.AZURE_VAULT_NAME }}"
+          SECRET_NAME="config_${{ github.event.inputs.server_name }}_${{ github.event.inputs.environment }}"
+          
+          CONFIG=$(az keyvault secret show \
+            --vault-name $VAULT_NAME \
+            --name $SECRET_NAME \
+            --query value -o tsv)
+          
+          echo "::add-mask::$CONFIG"
+          echo "CONFIG=$CONFIG" >> $GITHUB_ENV
+      
+      - name: Terraform Init
+        run: terraform init
+        working-directory: ./terraform
+      
+      - name: Terraform Plan with config
+        run: |
+          terraform plan \
+            -var="server_config=$CONFIG" \
+            -var="environment=${{ github.event.inputs.environment }}"
+        working-directory: ./terraform
+        env:
+          TF_VAR_server_config: ${{ env.CONFIG }}
