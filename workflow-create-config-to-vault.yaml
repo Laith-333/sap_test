@@ -38,11 +38,12 @@ env:
 jobs:
   create-and-store:
     runs-on: ubuntu-latest
-    
+    outputs:
+      secret_name: ${{ steps.naming.outputs.secret_name }}
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
+      - uses: actions/checkout@v4
+
       - name: Azure Login
         uses: azure/login@v1
         with:
@@ -53,131 +54,78 @@ jobs:
               "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
               "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
             }
-      
-      - name: Create config file
-        id: create_config
+
+      # ✅ STEP 1: Generate safe secret name automatically
+      - name: Generate secret name
+        id: naming
         run: |
-          # Create config file
-          cat > config.json <<EOF
-          {
-            "server_name": "${{ github.event.inputs.server_name }}",
-            "server_ip": "${{ github.event.inputs.server_ip }}",
-            "network": "${{ github.event.inputs.network }}",
-            "environment": "${{ github.event.inputs.environment }}",
-            "created_by": "${{ github.actor }}",
-            "created_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
-            "repository": "${{ github.repository }}",
-            "workflow_run": "${{ github.run_id }}"
-          }
-          EOF
+          RAW_NAME="config-${{ github.event.inputs.server_name }}-${{ github.event.inputs.environment }}"
           
-          echo "Config file created:"
+          # normalize (lowercase + replace invalid chars)
+          SAFE_NAME=$(echo "$RAW_NAME" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')
+          
+          echo "secret_name=$SAFE_NAME" >> $GITHUB_OUTPUT
+          echo "Using secret name: $SAFE_NAME"
+
+      # ✅ STEP 2: Create JSON safely
+      - name: Create config file
+        run: |
+          jq -n \
+            --arg name "${{ github.event.inputs.server_name }}" \
+            --arg ip "${{ github.event.inputs.server_ip }}" \
+            --arg net "${{ github.event.inputs.network }}" \
+            --arg env "${{ github.event.inputs.environment }}" \
+            --arg actor "${{ github.actor }}" \
+            --arg repo "${{ github.repository }}" \
+            --arg run "${{ github.run_id }}" \
+            --arg time "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            '{
+              server_name: $name,
+              server_ip: $ip,
+              network: $net,
+              environment: $env,
+              created_by: $actor,
+              repository: $repo,
+              workflow_run: $run,
+              created_at: $time
+            }' > config.json
+
           cat config.json
-          
-          # Generate secret name
-          SECRET_NAME="config-${{ github.event.inputs.server_name }}-${{ github.event.inputs.environment }}"
-          echo "secret_name=$SECRET_NAME" >> $GITHUB_OUTPUT
-      
-      - name: Display config preview
+
+      - name: Preview
         run: |
           echo "### Config Preview" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
           cat config.json >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Secret Name**: ${{ steps.create_config.outputs.secret_name }}" >> $GITHUB_STEP_SUMMARY
-      
-      - name: Request approval before storing
-        uses: trstringer/manual-approval@v1
-        with:
-          secret: ${{ secrets.GITHUB_TOKEN }}
-          approvers: ${{ github.actor }}
-          issue-title: "Approve: Store config '${{ github.event.inputs.server_name }}' in Key Vault"
-          issue-body: |
-            ## Configuration Details
-            
-            **Server Name**: ${{ github.event.inputs.server_name }}
-            **Server IP**: ${{ github.event.inputs.server_ip }}
-            **Network**: ${{ github.event.inputs.network }}
-            **Environment**: ${{ github.event.inputs.environment }}
-            
-            ### Generated Config:
-            ```json
-            {
-              "server_name": "${{ github.event.inputs.server_name }}",
-              "server_ip": "${{ github.event.inputs.server_ip }}",
-              "network": "${{ github.event.inputs.network }}",
-              "environment": "${{ github.event.inputs.environment }}",
-              "created_by": "${{ github.actor }}",
-              "created_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            }
-            ```
-            
-            **Secret Name**: config-${{ github.event.inputs.server_name }}-${{ github.event.inputs.environment }}
-            
-            Please review and approve to store in Key Vault.
-      
-      - name: Store config in Azure Key Vault
-        run: |
-          VAULT_NAME="${{ secrets.AZURE_VAULT_NAME }}"
-          SECRET_NAME="${{ steps.create_config.outputs.secret_name }}"
-          CONFIG_VALUE=$(cat config.json)
-          
-          # Store as secret (with hyphens converted to underscores for Key Vault naming)
-          SECRET_NAME_VAULT=$(echo $SECRET_NAME | tr '-' '_')
-          
-          echo "Storing secret: $SECRET_NAME_VAULT"
-          
-          az keyvault secret set \
-            --vault-name $VAULT_NAME \
-            --name $SECRET_NAME_VAULT \
-            --value "$CONFIG_VALUE"
-          
-          echo "✓ Secret stored successfully"
-          echo "secret_stored=true" >> $GITHUB_OUTPUT
-      
-      - name: Verify storage
-        run: |
-          VAULT_NAME="${{ secrets.AZURE_VAULT_NAME }}"
-          SECRET_NAME="${{ steps.create_config.outputs.secret_name }}"
-          SECRET_NAME_VAULT=$(echo $SECRET_NAME | tr '-' '_')
-          
-          echo "Verifying secret in Key Vault..."
-          az keyvault secret show \
-            --vault-name $VAULT_NAME \
-            --name $SECRET_NAME_VAULT \
-            --query name -o tsv
-          
-          echo "✓ Verification successful"
-      
-      - name: Log success
-        run: |
-          echo "### ✅ Config Stored in Key Vault" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Secret Name**: config_${{ github.event.inputs.server_name }}_${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Server IP**: ${{ github.event.inputs.server_ip }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Network**: ${{ github.event.inputs.network }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Stored by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Time**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
-      
-      - name: Cleanup
-        if: always()
-        run: |
-          rm -f config.json
-          echo "Cleaned up local config file"
+          echo "**Secret Name**: ${{ steps.naming.outputs.secret_name }}" >> $GITHUB_STEP_SUMMARY
 
+      # ✅ STEP 3: Store safely in Key Vault
+      - name: Store in Key Vault
+        run: |
+          VAULT_NAME="${{ secrets.AZURE_VAULT_NAME }}"
+          SECRET_NAME="${{ steps.naming.outputs.secret_name }}"
+
+          echo "Storing secret: $SECRET_NAME"
+
+          az keyvault secret set \
+            --vault-name "$VAULT_NAME" \
+            --name "$SECRET_NAME" \
+            --file config.json
+
+          echo "✓ Stored successfully"
+
+  # ✅ SECOND JOB uses SAME generated name
   use-config-in-terraform:
     runs-on: ubuntu-latest
     needs: create-and-store
-    if: success()
-    
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
+      - uses: actions/checkout@v4
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
-      
+
       - name: Azure Login
         uses: azure/login@v1
         with:
@@ -188,30 +136,23 @@ jobs:
               "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
               "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
             }
-      
-      - name: Retrieve config from Key Vault
-        id: retrieve
+
+      - name: Retrieve config
         run: |
           VAULT_NAME="${{ secrets.AZURE_VAULT_NAME }}"
-          SECRET_NAME="config_${{ github.event.inputs.server_name }}_${{ github.event.inputs.environment }}"
-          
+          SECRET_NAME="${{ needs.create-and-store.outputs.secret_name }}"
+
           CONFIG=$(az keyvault secret show \
-            --vault-name $VAULT_NAME \
-            --name $SECRET_NAME \
+            --vault-name "$VAULT_NAME" \
+            --name "$SECRET_NAME" \
             --query value -o tsv)
-          
+
           echo "::add-mask::$CONFIG"
           echo "CONFIG=$CONFIG" >> $GITHUB_ENV
-      
-      - name: Terraform Init
-        run: terraform init
-        working-directory: ./terraform
-      
-      - name: Terraform Plan with config
+
+      - name: Terraform Plan
         run: |
+          terraform init
           terraform plan \
-            -var="server_config=$CONFIG" \
-            -var="environment=${{ github.event.inputs.environment }}"
+            -var="server_config=$CONFIG"
         working-directory: ./terraform
-        env:
-          TF_VAR_server_config: ${{ env.CONFIG }}
